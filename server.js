@@ -46,16 +46,26 @@ const app = express();
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
- 
-];
+  "https://lead-gen-frontend-beryl.vercel.app",
+  process.env.FRONTEND_URL
+].filter(Boolean);
 
 app.use(cors({
   origin: function(origin, callback) {
     if (!origin) return callback(null, true);
 
-    if (allowedOrigins.indexOf(origin) !== -1) {
+    // Normalize origin to compare (remove trailing slash if present)
+    const normalizedOrigin = origin.endsWith('/') ? origin.slice(0, -1) : origin;
+
+    const isAllowed = allowedOrigins.some(o => {
+      const normalizedAllowed = o.endsWith('/') ? o.slice(0, -1) : o;
+      return normalizedAllowed === normalizedOrigin;
+    });
+
+    if (isAllowed) {
       callback(null, true);
     } else {
+      console.warn(`⚠️ CORS blocked for origin: ${origin}`);
       callback(new Error("CORS blocked"));
     }
   },
