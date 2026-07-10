@@ -5,7 +5,9 @@ import express from "express";
 import mongoose from "mongoose";
 import cors from "cors";
 import axios from "axios";
+import rateLimit from "express-rate-limit";
 
+import SearchCache from "./models/SearchCache.model.js";
 import authRoutes from "./routes/auth.js";
 // import listingRoutes from "./routes/Listing.js";
 import userRoutes from "./routes/user.js";
@@ -99,7 +101,10 @@ const indianCities = [
   { name: "Delhi", lat: 28.6139, lon: 77.2090 },
   { name: "Bengaluru", lat: 12.9716, lon: 77.5946 },
   { name: "Pune", lat: 18.5204, lon: 73.8567 },
-  { name: "Hyderabad", lat: 17.3850, lon: 78.4867 }
+  { name: "Hyderabad", lat: 17.3850, lon: 78.4867 },
+  { name: "Chennai", lat: 13.0827, lon: 80.2707 },
+  { name: "Kolkata", lat: 22.5726, lon: 88.3639 },
+  { name: "Ahmedabad", lat: 23.0225, lon: 72.5714 }
 ];
 
 const overpassEndpoints = [
@@ -273,6 +278,49 @@ const mapCategoryToOsmTags = (cat) => {
 };
 
 // ==========================================
+// 📏 HAVERSINE DISTANCE AND DEDUPLICATION HELPERS
+// ==========================================
+const getDistance = (lat1, lon1, lat2, lon2) => {
+  const R = 6371000; // Radius of Earth in meters
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = 
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c; // returns distance in meters
+};
+
+const dedupeLeads = (leads) => {
+  const deduped = [];
+  for (const lead of leads) {
+    const isDup = deduped.some(existing => {
+      // Check if same name (case-insensitive, normalized whitespace)
+      const sameName = existing.name.toLowerCase().trim().replace(/\s+/g, ' ') === lead.name.toLowerCase().trim().replace(/\s+/g, ' ');
+      
+      // Check if distance is within ~50 meters
+      const lat1 = Number(existing.latitude);
+      const lon1 = Number(existing.longitude);
+      const lat2 = Number(lead.latitude);
+      const lon2 = Number(lead.longitude);
+      
+      let closeDistance = false;
+      if (!isNaN(lat1) && !isNaN(lon1) && !isNaN(lat2) && !isNaN(lon2)) {
+        closeDistance = getDistance(lat1, lon1, lat2, lon2) <= 50;
+      }
+      
+      return sameName && closeDistance;
+    });
+    
+    if (!isDup) {
+      deduped.push(lead);
+    }
+  }
+  return deduped;
+};
+
+// ==========================================
 // 🎲 DYNAMIC MOCK LEADS GENERATOR (FALLBACK)
 // ==========================================
 const generateMockLeads = (category, city, lat, lon) => {
@@ -311,21 +359,54 @@ const generateMockLeads = (category, city, lat, lon) => {
       website: p.web || '',
       rating: parseFloat(randomRating),
       latitude: String(offsetLat),
-      longitude: String(offsetLon)
+      longitude: String(offsetLon),
+      isMock: true,
+      ratingSource: 'estimated'
     };
   });
 };
 
-app.get("/api/search", async (req, res) => {
+
+// Rate limiter for search: 20 requests per 15 minutes per IP
+const searchRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,
+  message: {
+    success: false,
+    message: "Too many search requests from this IP, please try again after 15 minutes."
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.get("/api/search", searchRateLimiter, async (req, res) => {
   const { city, category } = req.query;
   if (!city || !category) {
     return res.status(400).json({ message: "City and category query parameters are required." });
   }
 
+  const cleanCity = city.toLowerCase().trim();
+  const cleanCat = category.toLowerCase().trim();
+
+  // 1. Check MongoDB Cache first
+  try {
+    const cached = await SearchCache.findOne({ city: cleanCity, category: cleanCat });
+    if (cached) {
+      console.log(`Cache hit for city: "${cleanCity}", category: "${cleanCat}"`);
+      return res.json({
+        source: cached.source,
+        geocodeFailed: cached.geocodeFailed,
+        leads: cached.leads
+      });
+    }
+  } catch (cacheErr) {
+    console.error("Cache read error:", cacheErr.message);
+  }
+
   // Normalize Category using mapper
   const mappedCat = mapCategoryToOsmTags(category);
   const cleanInputLocation = city.toLowerCase().trim().replace(/\s+/g, "");
-  const isAllIndia = cleanInputLocation === "india" || cleanInputLocation === "allindia" || cleanInputLocation === "allindiachapahije";
+  const isAllIndia = cleanInputLocation === "india" || cleanInputLocation === "allindia";
 
   let tagQuery = "";
   let coordinates = null;
@@ -359,7 +440,26 @@ app.get("/api/search", async (req, res) => {
     if (!coordinates) {
       console.warn(`Location "${city}" could not be geocoded. Returning mock leads.`);
       const mockLeads = generateMockLeads(category, city);
-      return res.json(mockLeads);
+      const responseData = {
+        source: "mock",
+        geocodeFailed: true,
+        leads: mockLeads
+      };
+
+      // Save to cache
+      try {
+        await SearchCache.create({
+          city: cleanCity,
+          category: cleanCat,
+          source: "mock",
+          geocodeFailed: true,
+          leads: mockLeads
+        });
+      } catch (cacheErr) {
+        console.error("Cache write error:", cacheErr.message);
+      }
+
+      return res.json(responseData);
     }
 
     const { lat, lon } = coordinates;
@@ -426,8 +526,10 @@ app.get("/api/search", async (req, res) => {
       // Get website
       const website = tags.website || tags['contact:website'] || '';
 
-      // Get rating (default to standard fallback if not present)
-      const rating = tags.rating ? parseFloat(tags.rating) : parseFloat((3.5 + Math.random() * 1.3).toFixed(1));
+      // Get rating & ratingSource (no random fallback for real OSM leads)
+      const hasOsmRating = tags.rating ? true : false;
+      const rating = hasOsmRating ? parseFloat(tags.rating) : null;
+      const ratingSource = hasOsmRating ? "verified" : "estimated";
 
       return {
         name: tags.name || `Unnamed ${category}`,
@@ -436,13 +538,18 @@ app.get("/api/search", async (req, res) => {
         website,
         latitude,
         longitude,
-        rating
+        rating,
+        ratingSource,
+        isMock: false
       };
     });
 
+    // Deduplicate leads within ~50 meters with similar names
+    const dedupedMapped = dedupeLeads(mapped);
+
     // Filter to prioritize listings with real contact info (phone or website)
     // and exclude generic unnamed places
-    const validLeads = mapped.filter(el => {
+    const validLeads = dedupedMapped.filter(el => {
       const hasName = el.name && !el.name.toLowerCase().startsWith("unnamed");
       const hasContact = el.phone || el.website;
       return hasName && hasContact;
@@ -451,7 +558,7 @@ app.get("/api/search", async (req, res) => {
     let finalResults = validLeads;
     if (finalResults.length < 10) {
       // If we don't have 10 leads with contact info, fill the rest with other named places
-      const additional = mapped.filter(el => {
+      const additional = dedupedMapped.filter(el => {
         const hasName = el.name && !el.name.toLowerCase().startsWith("unnamed");
         const isAlreadyIncluded = validLeads.some(v => v.name === el.name && v.address === el.address);
         return hasName && !isAlreadyIncluded;
@@ -459,26 +566,96 @@ app.get("/api/search", async (req, res) => {
       finalResults = [...finalResults, ...additional];
     }
 
+    const slicedResults = finalResults.slice(0, 10);
+
     // If still 0 listings found, fall back to mock leads
-    if (finalResults.length === 0) {
+    if (slicedResults.length === 0) {
       console.log(`No OSM listings found for category: "${category}" in "${city}". Returning mock leads.`);
       const mockLeads = generateMockLeads(category, city, coordinates?.lat, coordinates?.lon);
-      return res.json(mockLeads);
+      const responseData = {
+        source: "mock",
+        geocodeFailed: false,
+        leads: mockLeads
+      };
+
+      // Save to cache
+      try {
+        await SearchCache.create({
+          city: cleanCity,
+          category: cleanCat,
+          source: "mock",
+          geocodeFailed: false,
+          leads: mockLeads
+        });
+      } catch (cacheErr) {
+        console.error("Cache write error (mock leads fallback):", cacheErr.message);
+      }
+
+      return res.json(responseData);
     }
 
-    // Limit results to exactly 10 leads
-    res.json(finalResults.slice(0, 10));
+    const responseData = {
+      source: "osm",
+      geocodeFailed: false,
+      leads: slicedResults
+    };
+
+    // Save to cache
+    try {
+      await SearchCache.create({
+        city: cleanCity,
+        category: cleanCat,
+        source: "osm",
+        geocodeFailed: false,
+        leads: slicedResults
+      });
+    } catch (cacheErr) {
+      console.error("Cache write error (successful leads):", cacheErr.message);
+    }
+
+    res.json(responseData);
   } catch (err) {
     console.error("Overpass search error, falling back to mock leads:", err.message);
     const mockLeads = generateMockLeads(category, city, coordinates?.lat, coordinates?.lon);
-    res.json(mockLeads);
+    const responseData = {
+      source: "mock",
+      geocodeFailed: false,
+      leads: mockLeads
+    };
+
+    // Save to cache
+    try {
+      await SearchCache.create({
+        city: cleanCity,
+        category: cleanCat,
+        source: "mock",
+        geocodeFailed: false,
+        leads: mockLeads
+      });
+    } catch (cacheErr) {
+      console.error("Cache write error (on error fallback):", cacheErr.message);
+    }
+
+    res.json(responseData);
   }
 });
+
+// Middleware to restrict routes to development environment only
+const restrictToDev = (req, res, next) => {
+  if (process.env.NODE_ENV !== "development") {
+    return res.status(404).json({
+      success: false,
+      message: "Route not found",
+      path: req.path
+    });
+  }
+  next();
+};
 
 // ==========================================
 // 🔍 DEBUG SEARCH ENDPOINT
 // ==========================================
-app.get("/api/debug-search", async (req, res) => {
+app.get("/api/debug-search", restrictToDev, async (req, res) => {
   const { city, category } = req.query;
   const logs = [];
   logs.push(`Querying debug search for city: "${city}", category: "${category}"`);
