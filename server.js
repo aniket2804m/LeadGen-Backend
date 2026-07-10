@@ -410,6 +410,125 @@ app.get("/api/search", async (req, res) => {
     res.status(500).json({ message: "Overpass API search failed", error: err.message });
   }
 });
+
+// ==========================================
+// 🔍 DEBUG SEARCH ENDPOINT
+// ==========================================
+app.get("/api/debug-search", async (req, res) => {
+  const { city, category } = req.query;
+  const logs = [];
+  logs.push(`Querying debug search for city: "${city}", category: "${category}"`);
+
+  let attempts = [city];
+  if (city.toLowerCase().includes(" in ")) {
+    const parts = city.split(/\s+in\s+/i);
+    attempts.push(parts[parts.length - 1]);
+    attempts.push(parts[0]);
+  }
+  if (city.includes(",")) {
+    const parts = city.split(",");
+    attempts.push(parts[parts.length - 1].trim());
+    attempts.push(parts[0].trim());
+  }
+
+  const cleanAttempts = Array.from(new Set(attempts))
+    .map(a => a.trim())
+    .filter(a => a.length > 2 && !/^(hotel|hotels|restaurant|restaurants|dentist|dentists|gym|gyms|cafe|cafes|plumber|plumbers|roofer|roofers)$/i.test(a));
+
+  logs.push(`Clean attempts: ${JSON.stringify(cleanAttempts)}`);
+
+  let coordinates = null;
+  for (const query of cleanAttempts) {
+    try {
+      const geocodeUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1`;
+      logs.push(`Geocoding attempt for: "${query}" via URL: ${geocodeUrl}`);
+      const response = await axios.get(geocodeUrl, {
+        headers: { 'User-Agent': 'LeadGenOS/1.0 (suryawanshianiket7576@gmail.com)' },
+        timeout: 5000
+      });
+      if (response.data && response.data.length > 0) {
+        coordinates = {
+          query,
+          display_name: response.data[0].display_name,
+          lat: response.data[0].lat,
+          lon: response.data[0].lon
+        };
+        logs.push(`Geocoding succeeded for "${query}" -> Lat: ${coordinates.lat}, Lon: ${coordinates.lon}`);
+        break;
+      } else {
+        logs.push(`Geocoding empty for "${query}"`);
+      }
+    } catch (e) {
+      logs.push(`Geocoding failed for "${query}": ${e.message}`);
+    }
+  }
+
+  if (!coordinates) {
+    return res.status(400).json({ success: false, logs, error: "Geocoding failed entirely" });
+  }
+
+  const mappedCat = mapCategoryToOsmTags(category);
+  logs.push(`Mapped category tags: ${JSON.stringify(mappedCat)}`);
+
+  const tagQuery = `
+    node["${mappedCat.type}"="${mappedCat.value}"](around:5000, ${coordinates.lat}, ${coordinates.lon});
+    way["${mappedCat.type}"="${mappedCat.value}"](around:5000, ${coordinates.lat}, ${coordinates.lon});
+    relation["${mappedCat.type}"="${mappedCat.value}"](around:5000, ${coordinates.lat}, ${coordinates.lon});
+  `;
+
+  const overpassQuery = `
+    [out:json][timeout:25];
+    (
+      ${tagQuery}
+    );
+    out center tags;
+  `;
+
+  logs.push("Overpass query constructed.");
+
+  let overpassData = null;
+  let successMirror = null;
+  for (const url of overpassEndpoints) {
+    try {
+      logs.push(`Attempting Overpass mirror: ${url}`);
+      const response = await axios.post(
+        url,
+        `data=${encodeURIComponent(overpassQuery)}`,
+        {
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "LeadGenOS/1.0 (suryawanshianiket7576@gmail.com)"
+          },
+          timeout: 25000
+        }
+      );
+      if (response.data && response.data.elements) {
+        overpassData = response.data;
+        successMirror = url;
+        logs.push(`Overpass mirror ${url} succeeded! Received ${response.data.elements.length} elements.`);
+        break;
+      } else {
+        logs.push(`Overpass mirror ${url} returned response without elements: ${typeof response.data === 'object' ? JSON.stringify(response.data).slice(0, 200) : String(response.data).slice(0, 200)}`);
+      }
+    } catch (err) {
+      logs.push(`Overpass mirror ${url} failed: ${err.message}`);
+    }
+  }
+
+  if (!overpassData) {
+    return res.status(500).json({ success: false, logs, error: "All Overpass mirrors failed" });
+  }
+
+  res.json({
+    success: true,
+    logs,
+    coordinates,
+    successMirror,
+    rawElementsCount: overpassData.elements.length,
+    sampleElement: overpassData.elements[0] || null
+  });
+});
+
 // ==========================================
 // HEALTH CHECK ROUTES
 // ==========================================
