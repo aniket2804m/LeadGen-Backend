@@ -473,6 +473,26 @@ router.post("/audit-lead", auditLimiter, async (req, res) => {
       "socialMedia": { "confidenceLevel": "Medium", "dataSource": "Web Scraper", "lastUpdated": "${new Date().toISOString().split('T')[0]}", "apiUsed": "Crawl text parser" },
       "competitors": { "confidenceLevel": "Medium", "dataSource": "Google Places", "lastUpdated": "${new Date().toISOString().split('T')[0]}", "apiUsed": "Google Places Text Search" }
     },
+    "aeoGeoAnalysis": {
+      "aeoScore": number,
+      "aeoDetails": {
+        "schemaMarkup": "Optimized" / "Needs improvement" / "Missing",
+        "faqStructured": true/false,
+        "conversationalReadability": "High" / "Medium" / "Low",
+        "factualDensity": "High" / "Medium" / "Low",
+        "strengths": ["string"],
+        "recommendations": ["string"]
+      },
+      "geoScore": number,
+      "geoDetails": {
+        "citationAuthority": "High" / "Medium" / "Low",
+        "sentimentScore": number,
+        "sourceDiversity": "High" / "Medium" / "Low",
+        "brandMentionFrequency": "High" / "Medium" / "Low",
+        "strengths": ["string"],
+        "recommendations": ["string"]
+      }
+    },
     "emailDraft": "Write a complete professional cold outreach email starting with Subject: ... Use Purnova Agency branding and local Indian pricing values.",
     "whatsAppDraft": "Write a short, engaging, direct WhatsApp outreach template in English. Include bullet points, bold key terms using markdown asterisks like *this*, refer to their specific business name, mention their website loading speed or missing website, and offer a quick call link.",
     "followUpEmail1": "Write a short professional follow-up email 1 to be sent 3 days later.",
@@ -612,6 +632,26 @@ router.post("/audit-lead", auditLimiter, async (req, res) => {
         businessInfo: { confidenceLevel: "High", dataSource: "Google Places API", lastUpdated: new Date().toISOString().split('T')[0], apiUsed: "Google Places details" },
         googleBusinessProfile: { confidenceLevel: "High", dataSource: "Google Places API", lastUpdated: new Date().toISOString().split('T')[0], apiUsed: "Google Places details" }
       },
+      aeoGeoAnalysis: {
+        aeoScore: resolvedWebsite ? 68 : 10,
+        aeoDetails: {
+          schemaMarkup: resolvedWebsite ? "Needs improvement" : "Missing",
+          faqStructured: false,
+          conversationalReadability: resolvedWebsite ? "Medium" : "Low",
+          factualDensity: resolvedWebsite ? "Medium" : "Low",
+          strengths: resolvedWebsite ? ["Structured business info present"] : ["None"],
+          recommendations: resolvedWebsite ? ["Integrate structured FAQ Schema markup", "Enhance conversational semantic structure"] : ["Launch website to enable AEO"]
+        },
+        geoScore: resolvedWebsite ? 62 : 5,
+        geoDetails: {
+          citationAuthority: resolvedWebsite ? "Medium" : "Low",
+          sentimentScore: resolvedRating ? Math.round(resolvedRating * 20) : 50,
+          sourceDiversity: resolvedWebsite ? "Low" : "Low",
+          brandMentionFrequency: resolvedWebsite ? "Medium" : "Low",
+          strengths: resolvedRating > 4.2 ? ["High review rating signals generative trust"] : ["None"],
+          recommendations: resolvedWebsite ? ["Increase brand citations across local directories", "Build authority backlinks from industry blogs"] : ["Establish brand presence to enable GEO"]
+        }
+      },
       emailDraft: `Subject: Digital Audit & Conversion optimizations for ${resolvedName}\n\nHi team,\n\nI was analyzing your business listing and noticed some digital optimization opportunities.`,
       whatsAppDraft: `Hi *${resolvedName}*! Just ran a digital audit on your profile.`,
       followUpEmail1: `Hi, just following up.`,
@@ -688,7 +728,8 @@ router.post("/audit-lead", auditLimiter, async (req, res) => {
         digitalFootprintScore: scoringResult.digitalFootprintScore,
         scoreCategory: scoringResult.scoreCategory,
         reasoning: scoringResult.reasoning,
-        breakdown: scoringResult.breakdown
+        breakdown: scoringResult.breakdown,
+        aeoGeoAnalysis: parsedAudit.aeoGeoAnalysis
       }
     };
 

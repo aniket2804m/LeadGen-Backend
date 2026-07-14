@@ -403,6 +403,83 @@ app.get("/api/search", searchRateLimiter, async (req, res) => {
     console.error("Cache read error:", cacheErr.message);
   }
 
+  // 2. Google Places API check (Primary strategy if key exists)
+  const googleApiKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (googleApiKey) {
+    try {
+      console.log(`Google Places API search active for: "${category}" in "${city}"`);
+      const textQuery = `${category} in ${city}`;
+      const textSearchUrl = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(textQuery)}&key=${googleApiKey}`;
+      
+      const searchRes = await axios.get(textSearchUrl);
+      const results = searchRes.data.results || [];
+      const topLeads = results.slice(0, 10);
+      
+      const detailPromises = topLeads.map(async (place) => {
+        try {
+          const detailsUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${place.place_id}&fields=name,formatted_address,formatted_phone_number,website,rating,geometry&key=${googleApiKey}`;
+          const detailsRes = await axios.get(detailsUrl);
+          const details = detailsRes.data.result || {};
+          
+          return {
+            name: details.name || place.name || `Unnamed ${category}`,
+            address: details.formatted_address || place.formatted_address || "Address N/A",
+            phone: details.formatted_phone_number || "",
+            website: details.website || "",
+            latitude: details.geometry?.location?.lat ? String(details.geometry.location.lat) : "",
+            longitude: details.geometry?.location?.lng ? String(details.geometry.location.lng) : "",
+            rating: details.rating || place.rating || null,
+            ratingSource: "verified",
+            id: place.place_id,
+            isMock: false
+          };
+        } catch (err) {
+          console.error("Error fetching Google Place details:", err.message);
+          return {
+            name: place.name || `Unnamed ${category}`,
+            address: place.formatted_address || "Address N/A",
+            phone: "",
+            website: "",
+            latitude: place.geometry?.location?.lat ? String(place.geometry.location.lat) : "",
+            longitude: place.geometry?.location?.lng ? String(place.geometry.location.lng) : "",
+            rating: place.rating || null,
+            ratingSource: "verified",
+            id: place.place_id,
+            isMock: false
+          };
+        }
+      });
+      
+      const leads = await Promise.all(detailPromises);
+      
+      if (leads.length > 0) {
+        const responseData = {
+          source: "google",
+          geocodeFailed: false,
+          leads: leads
+        };
+        
+        // Cache it
+        try {
+          await SearchCache.create({
+            city: cleanCity,
+            category: cleanCat,
+            source: "google",
+            geocodeFailed: false,
+            leads: leads
+          });
+        } catch (cacheErr) {
+          console.error("Cache write error (Google):", cacheErr.message);
+        }
+        
+        return res.json(responseData);
+      }
+    } catch (googleErr) {
+      console.error("Google Places API search failed, falling back to OSM:", googleErr.message);
+    }
+  }
+
+  // 3. Fallback to OpenStreetMap Overpass API
   // Normalize Category using mapper
   const mappedCat = mapCategoryToOsmTags(category);
   const cleanInputLocation = city.toLowerCase().trim().replace(/\s+/g, "");
